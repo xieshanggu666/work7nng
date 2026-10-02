@@ -20,6 +20,9 @@ const auctionTradeStatusMap = {
   reserved: ["warn", "待结算"],
   settled: ["ok", "已结算"],
   cancelled: ["danger", "已作废"],
+  reversed: ["muted", "已冲正"],
+  partial_reversed: ["warn", "部分回退"],
+  defaulted: ["danger", "违约欠缴"],
 };
 
 const actionTextMap = {
@@ -30,6 +33,8 @@ const actionTextMap = {
   "session.cancel": "撤场",
   "bid.place": "提交报价",
   "bid.cancel": "撤销报价",
+  "trade.reverse": "监管冲正",
+  "trade.default": "违约回退",
   "trade.read": "读取全量成交",
   "audit.read": "读取审计",
   "access.denied": "越权访问",
@@ -46,6 +51,7 @@ views.AuctionView = () => {
   const [trades, setTrades] = React.useState([]);
   const [logs, setLogs] = React.useState([]);
   const [myTrades, setMyTrades] = React.useState([]);
+  const [reversals, setReversals] = React.useState([]);
   const [tab, setTab] = React.useState("sessions"); // sessions / bids / trades / audit
   const [selYear, setSelYear] = React.useState(2026);
   const [form, setForm] = React.useState({
@@ -74,15 +80,18 @@ views.AuctionView = () => {
       setBids(b);
       setMyTrades(t);
       if (isRegulator) {
-        const [allT, l] = await Promise.all([
+        const [allT, l, rv] = await Promise.all([
           api.get(`/api/auctions/trades/all?session_id=${s.id}`),
           api.get(`/api/auctions/audit-logs?session_id=${s.id}`),
+          api.get(`/api/auctions/reversals/all?session_id=${s.id}`).catch(() => []),
         ]);
         setTrades(allT);
         setLogs(l);
+        setReversals(rv);
       } else {
         setTrades([]);
         setLogs([]);
+        setReversals([]);
       }
     } catch (e) { setMsg({ type: "err", text: e.message }); }
   }, [isRegulator]);
@@ -168,6 +177,46 @@ views.AuctionView = () => {
     try {
       await api.post(`/api/auctions/bids/${b.id}/cancel`, { reason: "企业主动撤单" }, api.idemKey());
       refresh("ok", `报价单 ${b.bid_no} 已撤销${b.side === "sell" ? "，占用配额已释放" : ""}`);
+    } catch (err) { setMsg({ type: "err", text: err.message }); }
+  };
+
+  const reverseTrade = async (t) => {
+    const reason = prompt(`监管冲正成交单 ${t.trade_no} 的原因（将联动回退配额/流水/履约清缴）：`, "");
+    if (reason === null || reason.trim().length < 2) return;
+    const partial = confirm(
+      "确定 → 整单冲正（买方自由可用不足时将拒绝）\n取消 → 部分冲正（尽力追回，不足记违约欠账）"
+    );
+    let qty = null;
+    if (!partial) {
+      const input = prompt(`部分冲正数量（吨，剩余可回退 ${fmtNum(t.quantity - (t.reversed_quantity || 0), 4)} 吨）：`, "");
+      if (input === null) return;
+      qty = Number(input);
+      if (!(qty > 0)) { setMsg({ type: "err", text: "冲正数量必须为正数" }); return; }
+    }
+    try {
+      const r = await api.post(`/api/auctions/trades/${t.id}/reverse`, {
+        reason: reason.trim(), quantity: qty, allow_partial: !partial,
+      }, api.idemKey());
+      refresh("ok", `成交单 ${t.trade_no} 冲正完成：追回退还 ${fmtNum(r.reversed_quantity, 4)} 吨`
+        + (r.cleared_refund_quantity ? `，退还履约清缴 ${fmtNum(r.cleared_refund_quantity, 4)} 吨` : "")
+        + (r.defaulted_quantity ? `，违约欠账 ${fmtNum(r.defaulted_quantity, 4)} 吨` : ""));
+    } catch (err) { setMsg({ type: "err", text: err.message }); }
+  };
+
+  const defaultTrade = async (t) => {
+    const reason = prompt(`违约回退成交单 ${t.trade_no} 的原因：`, "");
+    if (reason === null || reason.trim().length < 2) return;
+    const side = prompt("违约方（buyer=买方 / seller=卖方）：", "buyer");
+    if (side !== "buyer" && side !== "seller") { setMsg({ type: "err", text: "违约方只能是 buyer 或 seller" }); return; }
+    let qty = null;
+    const input = prompt(`回退数量（吨，留空回退全部剩余 ${fmtNum(t.quantity - (t.reversed_quantity || 0), 4)} 吨）：`, "");
+    if (input && input.trim()) qty = Number(input);
+    try {
+      const r = await api.post(`/api/auctions/trades/${t.id}/default`, {
+        reason: reason.trim(), side, quantity: qty,
+      }, api.idemKey());
+      refresh("ok", `成交单 ${t.trade_no} 违约回退：追回 ${fmtNum(r.reversed_quantity, 4)} 吨`
+        + (r.defaulted_quantity ? `，欠缴挂账 ${fmtNum(r.defaulted_quantity, 4)} 吨` : ""));
     } catch (err) { setMsg({ type: "err", text: err.message }); }
   };
 
@@ -328,7 +377,7 @@ views.AuctionView = () => {
       <table>
         <thead><tr>
           <th>成交单号</th><th>卖方</th>${isRegulator ? "" : ""}<th>买方</th><th>数量 (t)</th><th>成交价</th>
-          <th>序号</th><th>状态</th><th>结算时间</th>
+          <th>序号</th><th>状态</th><th>已回退 (t)</th><th>结算时间</th>${isAdmin ? html`<th>监管操作</th>` : ""}
         </tr></thead>
         <tbody>
           ${(isRegulator ? trades : myTrades).map((t) => html`
@@ -340,11 +389,48 @@ views.AuctionView = () => {
               <td>${fmtNum(t.price)} 元</td>
               <td>${t.alloc_seq}</td>
               <td>${html([StatusBadge(t.status)])}</td>
+              <td>${t.reversed_quantity ? fmtNum(t.reversed_quantity, 4) : "-"}</td>
               <td>${fmtTime(t.settled_at)}</td>
+              ${isAdmin ? html`<td style=${{whiteSpace: "nowrap"}}>
+                ${{
+                  settled: html`<button class="btn sm ghost" onClick=${() => reverseTrade(t)}>冲正</button>
+                    <button class="btn sm danger" style=${{marginLeft: 4}} onClick=${() => defaultTrade(t)}>违约回退</button>`,
+                  partial_reversed: html`<button class="btn sm ghost" onClick=${() => reverseTrade(t)}>继续冲正</button>
+                    <button class="btn sm danger" style=${{marginLeft: 4}} onClick=${() => defaultTrade(t)}>违约回退</button>`,
+                  defaulted: html`<button class="btn sm danger" onClick=${() => defaultTrade(t)}>继续追讨</button>`,
+                }[t.status] || html`<span class="muted">-</span>`}
+              </td>` : ""}
             </tr>`)}
-          ${(isRegulator ? trades : myTrades).length === 0 && html`<tr><td colspan="8" class="empty">暂无成交</td></tr>`}
+          ${(isRegulator ? trades : myTrades).length === 0 && html`<tr><td colspan="10" class="empty">暂无成交</td></tr>`}
         </tbody>
       </table>
+
+      ${isRegulator && reversals.length > 0 && html`
+      <h4 style=${{marginTop: 18}}>冲正 / 违约回退记录（本场次）</h4>
+      <table>
+        <thead><tr>
+          <th>回退单号</th><th>成交单</th><th>类型</th><th>卖方→买方</th>
+          <th>申请 (t)</th><th>追回退还 (t)</th><th>退还清缴 (t)</th><th>欠缴挂账 (t)</th>
+          <th>状态</th><th>操作人</th><th>时间</th><th>原因</th>
+        </tr></thead>
+        <tbody>
+          ${reversals.map((r) => html`
+            <tr key=${r.id}>
+              <td class="mono">${r.reversal_no}</td>
+              <td class="mono">${r.trade_no}</td>
+              <td>${{ regulator_reversal: "监管冲正", buyer_default: "买方违约", seller_default: "卖方违约" }[r.kind] || r.kind}</td>
+              <td>${r.seller_name}→${r.buyer_name}</td>
+              <td>${fmtNum(r.request_quantity, 4)}</td>
+              <td>${fmtNum(r.reversed_quantity, 4)}</td>
+              <td>${r.cleared_refund_quantity ? fmtNum(r.cleared_refund_quantity, 4) : "-"}</td>
+              <td>${r.defaulted_quantity ? html`<span style=${{color: "var(--red)"}}>${fmtNum(r.defaulted_quantity, 4)}</span>` : "-"}</td>
+              <td>${r.status === "completed" ? html`<span class="badge ok">完成</span>` : html`<span class="badge danger">部分追回</span>`}</td>
+              <td>${r.operator_name || "-"}</td>
+              <td>${r.tx_date || fmtTime(r.created_at)}</td>
+              <td style=${{maxWidth: 220}}>${r.reason}</td>
+            </tr>`)}
+        </tbody>
+      </table>`}
 
       ${isRegulator && html`
       <h4 style=${{marginTop: 18}}>本场次操作审计</h4>

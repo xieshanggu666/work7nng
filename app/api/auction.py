@@ -23,19 +23,26 @@ from app.schemas import (
     AuctionBidIn,
     AuctionSessionCancelIn,
     AuctionSessionIn,
+    AuctionTradeDefaultIn,
+    AuctionTradeReverseIn,
 )
 from app.services.auction_service import (
     AuctionError,
     Operator,
+    REVERSAL_BUYER_DEFAULT,
+    REVERSAL_SELLER_DEFAULT,
+    REVERSAL_REGULATOR,
     cancel_bid,
     cancel_session,
     create_session,
     list_audit_logs,
     list_bids,
     list_sessions,
+    list_trade_reversals,
     list_trades,
     open_session,
     place_bid,
+    reverse_settled_trade,
     run_matching,
     settle_session,
     write_audit,
@@ -135,9 +142,41 @@ def _serialize_trade(db: Session, t: AuctionTrade) -> dict:
         "price": float(t.price),
         "alloc_seq": t.alloc_seq,
         "status": t.status,
+        "reversed_quantity": float(t.reversed_quantity or 0),
+        "cleared_quantity": float(t.cleared_quantity or 0),
+        "cleared_refunded_quantity": float(t.cleared_refunded_quantity or 0),
         "settled_at": t.settled_at,
+        "last_reversed_at": t.last_reversed_at,
         "cancelled_at": t.cancelled_at,
         "created_at": t.created_at,
+    }
+
+
+def _serialize_reversal(db: Session, r) -> dict:
+    buyer = db.get(Company, r.buyer_id)
+    seller = db.get(Company, r.seller_id)
+    trade = db.get(AuctionTrade, r.trade_id)
+    return {
+        "id": r.id,
+        "reversal_no": r.reversal_no,
+        "trade_id": r.trade_id,
+        "trade_no": trade.trade_no if trade else str(r.trade_id),
+        "session_id": r.session_id,
+        "buyer_id": r.buyer_id,
+        "seller_id": r.seller_id,
+        "buyer_name": buyer.name if buyer else str(r.buyer_id),
+        "seller_name": seller.name if seller else str(r.seller_id),
+        "year": r.year,
+        "kind": r.kind,
+        "request_quantity": float(r.request_quantity),
+        "reversed_quantity": float(r.reversed_quantity),
+        "cleared_refund_quantity": float(r.cleared_refund_quantity),
+        "defaulted_quantity": float(r.defaulted_quantity),
+        "reason": r.reason,
+        "status": r.status,
+        "operator_name": r.operator_name,
+        "tx_date": r.tx_date,
+        "created_at": r.created_at,
     }
 
 
@@ -391,3 +430,131 @@ def all_trades(
         raise HTTPException(status_code=403, detail="企业仅可查看本企业参与的成交：/api/auctions/my-trades")
     trades = list_trades(db, session_id=session_id)
     return [_serialize_trade(db, t) for t in trades]
+
+
+# --------------------------------------------------------------------------- #
+# 已结算成交单：监管冲正 / 违约回退
+# --------------------------------------------------------------------------- #
+
+def _do_reverse(
+    request: Request,
+    trade_id: int,
+    db: Session,
+    user: User,
+    *,
+    kind: str,
+    reason: str,
+    quantity: float | None,
+    allow_partial: bool,
+    tx_date: str,
+    idem: str | None,
+    action: str,
+):
+    trade = db.get(AuctionTrade, trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="成交单不存在")
+    try:
+        reversal = reverse_settled_trade(
+            db, trade_id,
+            kind=kind,
+            reason=reason,
+            quantity=quantity,
+            allow_partial=allow_partial,
+            tx_date=tx_date,
+            operator=_operator(user, request),
+            idempotency_key=idem,
+        )
+    except AuctionError as e:
+        # 监管冲正/违约回退被拒（状态非法、足额不足等）也留痕
+        write_audit(
+            db, _operator(user, request), action,
+            target_type="trade", target_id=trade_id, session_id=trade.session_id,
+            detail=f"{action} 被拒绝（成交单 {trade.trade_no}）：{e}",
+            result="denied", commit=True,
+        )
+        raise HTTPException(status_code=400, detail=str(e))
+    return _serialize_reversal(db, reversal)
+
+
+@router.post("/trades/{trade_id}/reverse")
+def trade_reverse(
+    trade_id: int,
+    data: AuctionTradeReverseIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    """监管冲正已结算成交：配额/流水/履约清缴/审计同事务回退，支持部分冲正。"""
+    idem = data.idempotency_key or request.headers.get("idempotency-key")
+    return _do_reverse(
+        request, trade_id, db, user,
+        kind=REVERSAL_REGULATOR,
+        reason=data.reason,
+        quantity=data.quantity,
+        allow_partial=data.allow_partial,
+        tx_date=data.tx_date,
+        idem=idem,
+        action="trade.reverse",
+    )
+
+
+@router.post("/trades/{trade_id}/default")
+def trade_default(
+    trade_id: int,
+    data: AuctionTradeDefaultIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    """违约回退已结算成交：从违约方对手侧尽力追回，欠量挂账（允许部分回退）。"""
+    idem = data.idempotency_key or request.headers.get("idempotency-key")
+    kind = REVERSAL_BUYER_DEFAULT if data.side == "buyer" else REVERSAL_SELLER_DEFAULT
+    return _do_reverse(
+        request, trade_id, db, user,
+        kind=kind,
+        reason=data.reason,
+        quantity=data.quantity,
+        allow_partial=True,
+        tx_date=data.tx_date,
+        idem=idem,
+        action="trade.default",
+    )
+
+
+@router.get("/trades/{trade_id}/reversals")
+def trade_reversals(
+    request: Request,
+    trade_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """成交单回退记录：监管/核查可查任意单；企业仅限本企业参与的成交。"""
+    trade = db.get(AuctionTrade, trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="成交单不存在")
+    if user.role == "enterprise" and user.company_id not in (trade.buyer_id, trade.seller_id):
+        _audit_denied(
+            db, user, request, "trade.read",
+            f"企业 {user.company_id} 试图读取成交 {trade.trade_no} 的冲正/回退记录",
+        )
+        raise HTTPException(status_code=403, detail="仅成交参与方或监管可查看回退记录")
+    rows = list_trade_reversals(db, trade_id=trade_id)
+    return [_serialize_reversal(db, r) for r in rows]
+
+
+@router.get("/reversals/all")
+def all_reversals(
+    request: Request,
+    session_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """全部冲正/违约回退单（监管/核查）；企业 403 并审计。"""
+    if user.role == "enterprise":
+        _audit_denied(
+            db, user, request, "trade.read",
+            f"企业 {user.company_id} 试图读取全市场冲正/回退记录",
+        )
+        raise HTTPException(status_code=403, detail="企业仅可查看本企业成交的回退记录")
+    rows = list_trade_reversals(db, session_id=session_id)
+    return [_serialize_reversal(db, r) for r in rows]

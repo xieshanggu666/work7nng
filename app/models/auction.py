@@ -112,7 +112,14 @@ class AuctionTrade(Base):
     状态：
     - reserved：撮合完成，卖方配额已转为交易占用，等待场次统一结算；
     - settled：已结算，卖方出库 / 买方到账 / 履约缺口核销全部落库；
-    - cancelled：撮合后场次被监管撤销，占用已释放，成交单作废。
+    - cancelled：撮合后场次被监管撤销，占用已释放，成交单作废；
+    - reversed：结算后监管冲正，成交配额已全部追回并退还卖方（终态）；
+    - partial_reversed：结算后部分冲正/违约回退，仍有剩余成交未回退；
+    - defaulted：违约回退，买方自由可用不足导致部分配额无法追回，
+      未追回量记入回退单 defaulted_qty 作为违约欠缴挂账。
+
+    已结算成交单不允许“无错撤销”，只能由监管冲正/违约回退链路逐笔
+    （或部分数量）回退：配额、流水、履约清缴与审计记录在同一事务联动。
     """
 
     __tablename__ = "auction_trades"
@@ -128,9 +135,70 @@ class AuctionTrade(Base):
     quantity = Column(Numeric(18, 4), nullable=False)
     price = Column(Numeric(18, 2), nullable=False, default=0)  # 统一出清价
     alloc_seq = Column(Integer, nullable=False, default=0)     # 价格-时间优先撮合序号
-    status = Column(String(16), nullable=False, default="reserved", index=True)
+    # reserved/settled/cancelled/reversed/partial_reversed/defaulted
+    status = Column(String(20), nullable=False, default="reserved", index=True)
     settled_at = Column(DateTime, nullable=True)
+    # 累计已回退成交量（监管冲正/违约回退共享同一把“成交量预算”，永不超过 quantity）
+    reversed_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    # 结算联动清缴中归属于本成交单、由到账配额实际补缴的量（FIFO 归因），
+    # 回退时按比例优先退还该部分履约清缴；冻结清缴不属于成交到账，不随冲正回退
+    cleared_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    # 其中已经随历次回退退还履约的量（累计，绝不超过 cleared_quantity）
+    cleared_refunded_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    last_reversed_at = Column(DateTime, nullable=True)
     cancelled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AuctionTradeReversal(Base):
+    """已结算成交单的监管冲正/违约回退单。
+
+    一笔成交单可分多次回退（部分回退），每次回退生成一张回退单并同事务：
+    1. 按回退量占成交单的比例，优先退还结算时由本成交到账配额补缴的履约清缴
+       （回补买方履约缺口、恢复配额状态）；
+    2. 从买方自由可用配额追回成交配额（尽力而为，不足部分记 defaulted_qty）；
+    3. 实际追回量退还卖方账户并记入卖方流水。
+
+    并发与幂等：
+    - 幂等键唯一约束 + 进程内场次/账户/清缴键锁（锁序与结算一致）；
+    - 成交单累计回退量用条件 UPDATE 抢占，累计不超过成交量，
+      重复提交只返回首张回退单，绝不重复追回/退还。
+
+    kind：
+    - regulator_reversal：监管冲正（要求买方自由可用足额覆盖，否则拒绝整笔回滚，
+      除非显式允许部分回退 allow_partial）；
+    - buyer_default / seller_default：违约回退（买方/卖方违约），
+      买方可用不足时自动部分追回，缺口 defaulted_qty 挂账。
+    """
+
+    __tablename__ = "auction_trade_reversals"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_auction_trade_reversal_idem"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    reversal_no = Column(String(32), nullable=False, unique=True, index=True)
+    trade_id = Column(Integer, ForeignKey("auction_trades.id"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("auction_sessions.id"), nullable=False, index=True)
+    buyer_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    seller_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    # regulator_reversal / buyer_default / seller_default
+    kind = Column(String(24), nullable=False)
+    # 申请回退量（监管可只冲正成交单的一部分）
+    request_quantity = Column(Numeric(18, 4), nullable=False)
+    # 实际从买方追回并退还卖方的量
+    reversed_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    # 其中退还买方履约清缴（回补缺口）的量
+    cleared_refund_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    # 买方自由可用不足、未能追回的违约挂账量
+    defaulted_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    reason = Column(String(256), nullable=False, default="")
+    status = Column(String(16), nullable=False, default="completed")  # completed/partial
+    idempotency_key = Column(String(64), nullable=True)
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    operator_name = Column(String(64), nullable=False, default="")
+    tx_date = Column(String(10), nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 

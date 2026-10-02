@@ -435,3 +435,234 @@ class TestSettlementLoop:
         assert db.query(AllowanceTransaction).filter_by(tx_type="auction_deliver_in").count() == 1
         assert db.query(AllowanceTransaction).filter_by(tx_type="auction_deliver_out").count() == 1
         db.close()
+
+
+# --------------------------------------------------------------------------- #
+# 已结算成交：监管冲正 / 违约回退 API
+# --------------------------------------------------------------------------- #
+
+def _settled_trade(client, ids, *, qty=300, with_deficit=False):
+    """走完整流程并返回 (trade_id, session_id)。with_deficit 先给买方造缺口。"""
+    if with_deficit:
+        # 买方初始 200，排放 500 → 冻结 200、缺口 300，到账 300 恰好足额补缴
+        _setup_buyer_deficit(ids["c2"], qty + 200)
+    sid = create_open_session(client)["id"]
+    login(client, "s1")
+    client.post(f"/api/auctions/{sid}/bids", json={"side": "sell", "quantity": qty, "price": 80})
+    login(client, "b1")
+    client.post(f"/api/auctions/{sid}/bids", json={"side": "buy", "quantity": qty, "price": 90})
+    login(client, "admin")
+    client.post(f"/api/auctions/{sid}/match")
+    res = client.post(f"/api/auctions/{sid}/settle")
+    assert res.status_code == 200
+    trades = client.get("/api/auctions/trades/all").json()
+    trade = next(t for t in trades if t["session_id"] == sid)
+    return trade["id"], sid
+
+
+class TestTradeReversalApi:
+    def test_admin_full_reversal_restores_ledger(self, ctx):
+        """监管全额冲正：买卖双方配额回退、清缴退还、成交单终态 reversed。"""
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=300, with_deficit=True)
+
+        res = client.post(f"/api/auctions/trades/{tid}/reverse", json={
+            "reason": "监管核查发现异常，整单冲正",
+        }, headers={"Idempotency-Key": "REV-1"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["kind"] == "regulator_reversal"
+        assert body["status"] == "completed"
+        assert body["reversed_quantity"] == 300
+        assert body["cleared_refund_quantity"] == 300
+        assert body["defaulted_quantity"] == 0
+
+        # 幂等重放返回同一张回退单
+        again = client.post(f"/api/auctions/trades/{tid}/reverse", json={
+            "reason": "监管核查发现异常，整单冲正",
+        }, headers={"Idempotency-Key": "REV-1"})
+        assert again.json()["id"] == body["id"]
+
+        trade = next(t for t in client.get("/api/auctions/trades/all").json()
+                     if t["id"] == tid)
+        assert trade["status"] == "reversed"
+        assert trade["reversed_quantity"] == 300
+
+        # 卖方收回 300（600 结算后 + 300 退还 = 900... 卖方初始 1000，结算划出 300 → 700）
+        login(client, "s1")
+        s_acc = client.get(f"/api/companies/{ids['c1']}/account?year={YEAR}").json()
+        assert s_acc["current_balance"] == 1000
+
+    def test_partial_reversal_then_remainder(self, ctx):
+        """部分冲正 100（无缺口，买方足额）：partial_reversed；再冲剩余 200 终结。"""
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=300)
+
+        r1 = client.post(f"/api/auctions/trades/{tid}/reverse", json={
+            "reason": "部分冲正第一批", "quantity": 100,
+        })
+        assert r1.status_code == 200
+        assert r1.json()["status"] == "completed"
+        trade = next(t for t in client.get("/api/auctions/trades/all").json()
+                     if t["id"] == tid)
+        assert trade["status"] == "partial_reversed"
+        assert trade["reversed_quantity"] == 100
+
+        r2 = client.post(f"/api/auctions/trades/{tid}/reverse", json={"reason": "冲正剩余"})
+        assert r2.status_code == 200
+        assert r2.json()["request_quantity"] == 200
+        trade = next(t for t in client.get("/api/auctions/trades/all").json()
+                     if t["id"] == tid)
+        assert trade["status"] == "reversed"
+
+        rows = client.get(f"/api/auctions/trades/{tid}/reversals").json()
+        assert len(rows) == 2
+
+    def test_strict_reversal_short_buyer_returns_400_and_audits(self, ctx):
+        """买方把到账配额卖出致自由可用不足：严格冲正 400 拒绝并留审计，
+        状态与账本不变；违约回退放行并挂账。"""
+        from app.core.ledger import apply_ledger_delta, lock_row_for_write, transactional
+        from app.models import AllowanceAccount
+        from app.services.quota_service import _add_ledger_tx
+
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=300)  # 无缺口：买方到账后持仓 500
+        db = next(app.dependency_overrides[get_db]())
+        acc = db.query(AllowanceAccount).filter_by(company_id=ids["c2"], year=YEAR).one()
+        with transactional(db):
+            acc = lock_row_for_write(db, acc.id)
+            bal, frz, rsv = apply_ledger_delta(db, acc.id, -450, 0, 0)  # 仅余 50
+            _add_ledger_tx(db, acc, "sell", 450, bal, frz, "二级市场", "后续卖出",
+                           reserved_after=rsv)
+        db.close()
+
+        res = client.post(f"/api/auctions/trades/{tid}/reverse", json={
+            "reason": "买方余额不足时严格冲正",
+        })
+        assert res.status_code == 400
+        assert "自由可用" in res.json()["detail"]
+
+        trade = next(t for t in client.get("/api/auctions/trades/all").json()
+                     if t["id"] == tid)
+        assert trade["status"] == "settled"
+        assert trade["reversed_quantity"] == 0
+        logs = client.get("/api/auctions/audit-logs?limit=50").json()
+        denied = [l for l in logs if l["action"] == "trade.reverse" and l["result"] == "denied"]
+        assert denied, "冲正被拒必须留审计"
+
+        # 显式允许部分冲正则放行（追回 50）
+        ok = client.post(f"/api/auctions/trades/{tid}/reverse", json={
+            "reason": "改为部分冲正", "allow_partial": True,
+        })
+        assert ok.status_code == 200
+        assert ok.json()["reversed_quantity"] == 50
+        assert ok.json()["defaulted_quantity"] == 250
+
+    def test_buyer_default_partial_books_shortfall(self, ctx):
+        """买方违约：结算后买方把配额卖出致可用不足，违约回退部分追回+欠量挂账。"""
+        from app.core.ledger import apply_ledger_delta, lock_row_for_write, transactional
+        from app.models import AllowanceAccount
+        from app.services.quota_service import _add_ledger_tx
+
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=300)  # 买方到账后持仓 500
+        db = next(app.dependency_overrides[get_db]())
+        acc = db.query(AllowanceAccount).filter_by(company_id=ids["c2"], year=YEAR).one()
+        with transactional(db):
+            acc = lock_row_for_write(db, acc.id)
+            bal, frz, rsv = apply_ledger_delta(db, acc.id, -400, 0, 0)
+            _add_ledger_tx(db, acc, "sell", 400, bal, frz, "二级市场", "后续卖出",
+                           reserved_after=rsv)
+        db.close()
+
+        res = client.post(f"/api/auctions/trades/{tid}/default", json={
+            "reason": "买方资金链断裂违约", "side": "buyer",
+        })
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["kind"] == "buyer_default"
+        assert body["status"] == "partial"
+        assert body["reversed_quantity"] == 100
+        assert body["defaulted_quantity"] == 200
+        trade = next(t for t in client.get("/api/auctions/trades/all").json()
+                     if t["id"] == tid)
+        assert trade["status"] == "defaulted"
+
+    def test_seller_default_requires_side(self, ctx):
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=100)
+        bad = client.post(f"/api/auctions/trades/{tid}/default", json={
+            "reason": "缺少违约方", "side": "exchange",
+        })
+        assert bad.status_code == 422
+        ok = client.post(f"/api/auctions/trades/{tid}/default", json={
+            "reason": "卖方资质违约", "side": "seller",
+        })
+        assert ok.status_code == 200
+        assert ok.json()["kind"] == "seller_default"
+
+    def test_enterprise_and_verifier_forbidden(self, ctx):
+        """企业与核查员均不能发起冲正/违约回退（403）。"""
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=100)
+        login(client, "b1")
+        assert client.post(f"/api/auctions/trades/{tid}/reverse",
+                           json={"reason": "企业尝试冲正"}).status_code == 403
+        assert client.post(f"/api/auctions/trades/{tid}/default",
+                           json={"reason": "企业尝试违约", "side": "buyer"}).status_code == 403
+        login(client, "verifier")
+        assert client.post(f"/api/auctions/trades/{tid}/reverse",
+                           json={"reason": "核查员尝试冲正"}).status_code == 403
+
+    def test_enterprise_can_only_read_own_trade_reversals(self, ctx):
+        """企业可查本企业成交的回退记录，查他人成交 403 并审计；全量列表 403。"""
+        client, ids = ctx
+        tid, sid = _settled_trade(client, ids, qty=100)
+        client.post(f"/api/auctions/trades/{tid}/reverse", json={"reason": "监管冲正留痕"})
+
+        login(client, "b1")
+        assert client.get(f"/api/auctions/trades/{tid}/reversals").status_code == 200
+        assert client.get("/api/auctions/reversals/all").status_code == 403
+
+        login(client, "e3")  # 第三方企业
+        assert client.get(f"/api/auctions/trades/{tid}/reversals").status_code == 403
+
+        login(client, "admin")
+        rows = client.get("/api/auctions/reversals/all").json()
+        assert len(rows) == 1
+        logs = client.get("/api/auctions/audit-logs?limit=50").json()
+        denied = [l for l in logs if l["result"] == "denied" and l["action"] == "trade.read"]
+        assert len(denied) >= 2
+
+    def test_reverse_unknown_trade_404(self, ctx):
+        client, _ = ctx
+        login(client, "admin")
+        res = client.post("/api/auctions/trades/99999/reverse", json={"reason": "不存在的成交"})
+        assert res.status_code == 404
+
+    def test_concurrent_reverse_only_one_succeeds(self, file_ctx):
+        """HTTP 多连接并发全额冲正：只有一次追回/退还，其余被预算抢占拒绝。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        client, ids = file_ctx
+        tid, sid = _settled_trade(client, ids, qty=300)
+
+        def fire(i):
+            c = TestClient(app)
+            c.post("/api/auth/login", json={"username": "admin", "password": "123456"})
+            r = c.post(f"/api/auctions/trades/{tid}/reverse",
+                       json={"reason": f"并发冲正{i}"},
+                       headers={"Idempotency-Key": f"CONC-REV-{i}"})
+            return r.status_code
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            codes = list(pool.map(fire, range(4)))
+        assert codes.count(200) == 1
+        assert sorted(set(codes)) == [200, 400]
+
+        db = next(app.dependency_overrides[get_db]())
+        from app.models import AuctionTradeReversal
+        assert db.query(AuctionTradeReversal).count() == 1
+        assert db.query(AllowanceTransaction).filter_by(
+            tx_type="auction_reversal_clawback").count() == 1
+        db.close()

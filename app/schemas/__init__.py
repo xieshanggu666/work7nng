@@ -115,3 +115,23 @@ class AuctionBidIn(BaseModel):
 
 class AuctionBidCancelIn(BaseModel):
     reason: str = Field(default="", max_length=256)
+
+
+class AuctionTradeReverseIn(BaseModel):
+    """已结算成交单监管冲正（可部分冲正，默认足额；买方可用不足则拒绝）。"""
+
+    reason: str = Field(min_length=2, max_length=256)
+    quantity: float | None = Field(default=None, gt=0)
+    allow_partial: bool = False
+    tx_date: str = ""
+    idempotency_key: str | None = None
+
+
+class AuctionTradeDefaultIn(BaseModel):
+    """已结算成交单违约回退：允许部分追回，欠量挂账。"""
+
+    reason: str = Field(min_length=2, max_length=256)
+    side: str = Field(pattern="^(buyer|seller)$")
+    quantity: float | None = Field(default=None, gt=0)
+    tx_date: str = ""
+    idempotency_key: str | None = None

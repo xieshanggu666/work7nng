@@ -9,7 +9,9 @@
 - trade_orders：企业间交易订单新表（建表由 SQLAlchemy 元数据完成，存在则跳过）；
   auto_clear_deficit 列控制交割时是否自动核销买方同年度履约缺口
 - auction_sessions / auction_bids / auction_trades / auction_audit_logs：
-  碳配额集中竞价市场四张新表（建表由 SQLAlchemy 元数据完成，存在则跳过）
+  碳配额集中竞价市场四张新表（建表由 SQLAlchemy 元数据完成，存在则跳过）；
+  auction_trades 增加 reversed_quantity/cleared_quantity/cleared_refunded_quantity/
+  last_reversed_at，auction_trade_reversals 为已结算成交监管冲正/违约回退单新表
 - mrv_reports：reversed_by/reversed_at/reversal_reason
 - 活跃履约记录保持 (company_id, year) 唯一；冲正归档记录可重新批准
 """
@@ -29,6 +31,7 @@ from app.models import (  # noqa: F401,E402
     AuctionBid,
     AuctionSession,
     AuctionTrade,
+    AuctionTradeReversal,
     TradeOrder,
 )
 
@@ -163,6 +166,25 @@ def main():
             "trade_orders",
             "auto_clear_deficit",
             "auto_clear_deficit INTEGER NOT NULL DEFAULT 1",
+        )
+
+    if "auction_trades" in tables:
+        # 已结算成交单的监管冲正/违约回退：累计回退量、结算联动清缴归因量及已退还量
+        _add_column(
+            statements, inspector, "auction_trades", "reversed_quantity",
+            "reversed_quantity NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+        _add_column(
+            statements, inspector, "auction_trades", "cleared_quantity",
+            "cleared_quantity NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+        _add_column(
+            statements, inspector, "auction_trades", "cleared_refunded_quantity",
+            "cleared_refunded_quantity NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+        _add_column(
+            statements, inspector, "auction_trades", "last_reversed_at",
+            "last_reversed_at TIMESTAMP",
         )
 
     if "mrv_reports" in tables:

@@ -749,3 +749,92 @@ def settle_buyer_deficit_on_auction(
     )
     db.refresh(record)
     return record
+
+
+def reverse_auction_clearance(
+    db: Session,
+    trade: "AuctionTrade",
+    refund_cleared: float,
+    tx_date: str,
+    *,
+    counterparty: str = "监管冲正",
+    remark: str = "",
+    reversal: "AuctionTradeReversal | None" = None,
+) -> tuple[float, ComplianceRecord | None]:
+    """回退竞价结算联动的履约清缴（监管冲正/违约回退内核）。
+
+    必须在回退事务内调用：调用方已持有 ``clear:<buyer>:<year>`` 与买方账户键
+    （回退锁集合与结算一致），本函数不再加锁、不自行提交，与配额追回/退还卖方
+    同生共死。
+
+    只回退结算时由**本成交到账配额**实际补缴的部分（``auction_deficit_clear``，
+    已按 FIFO 归因到成交单 ``cleared_quantity``）；冻结配额清缴（``frozen_clear``）
+    是企业用既有冻结配额履行的义务，与竞价成交无关，不在冲正范围。
+
+    账务处理（``refund_cleared`` 为本次回退量中对应到账补缴的量）：
+    - 重新向买方账户入账该量（current 增加，不动 frozen/reserved）；
+    - 履约记录已清缴量同减、缺口回补，状态/配额状态按剩余义务重算；
+    - 随后调用方再从买方自由可用追回成交配额——先入账再追回使两笔流水
+      各自可审计，且冻结/占用始终不被动用。
+
+    返回 ``(实际退还清缴量, 履约记录)``：无活跃记录（如报告已冲正归档）时
+    不退清缴，返回 ``(0.0, None)``，成交配额的追回仍正常执行。
+    """
+    refund_cleared = round(min(max(refund_cleared, 0.0), float(trade.cleared_quantity or 0)), 4)
+    if refund_cleared <= 0:
+        return 0.0, None
+
+    record = _get_active_record(db, trade.buyer_id, trade.year)
+    if record is None or record.status == "reversed":
+        return 0.0, None
+
+    account = _get_account(db, trade.buyer_id, trade.year)
+    if account is None:
+        raise ValueError("买方配额账户缺失，清缴回退已中止")
+
+    # 防御性封顶：活跃记录上现存的已清缴量可能已被其它冲正（如报告冲正）退还，
+    # 本成交的退还不能超过“现存清缴中尚可退回”的量。
+    refund_cleared = round(min(refund_cleared, float(record.cleared_amount or 0)), 4)
+    if refund_cleared <= 0:
+        return 0.0, record
+
+    account = lock_row_for_write(db, account.id)
+    balance_after, frozen_after, reserved_after = apply_ledger_delta(
+        db, account.id, refund_cleared, 0, 0
+    )
+    _add_ledger_tx(
+        db,
+        account,
+        "auction_clearance_reversal",
+        refund_cleared,
+        balance_after,
+        frozen_after,
+        counterparty,
+        remark or f"成交单 {trade.trade_no} 冲正，退还竞价到账配额补缴 {refund_cleared} 吨",
+        tx_date=tx_date,
+        reserved_after=reserved_after,
+        auction_trade_id=trade.id,
+        price=float(trade.price),
+    )
+
+    emission = round(float(record.verified_emission), 4)
+    cleared = round(max(float(record.cleared_amount) - refund_cleared, 0.0), 4)
+    frozen_available = round(float(record.frozen_amount or 0), 4)
+    deficit = round(emission - cleared, 4)
+    record.cleared_amount = cleared
+    record.deficit = max(deficit, 0.0)
+    if emission <= 0:
+        record.status = "compliant"
+    else:
+        record.status = "compliant" if deficit <= 0 else "deficit"
+
+    if emission <= 0 or deficit <= 0:
+        _set_quota_status(db, trade.buyer_id, trade.year, "cleared")
+    elif frozen_available:
+        _set_quota_status(db, trade.buyer_id, trade.year, "frozen")
+    else:
+        _set_quota_status(db, trade.buyer_id, trade.year, "allocated")
+
+    db.flush()
+    db.refresh(record)
+    return refund_cleared, record

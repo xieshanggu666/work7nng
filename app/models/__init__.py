@@ -10,6 +10,7 @@ from app.models.auction import (
     AuctionBid,
     AuctionSession,
     AuctionTrade,
+    AuctionTradeReversal,
 )
 from app.models.company import Company, EmissionScope
 from app.models.emission import (
@@ -39,6 +40,7 @@ __all__ = [
     "AuctionSession",
     "AuctionBid",
     "AuctionTrade",
+    "AuctionTradeReversal",
     "AuctionAuditLog",
     "MrvReport",
 ]

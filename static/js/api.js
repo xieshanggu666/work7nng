@@ -53,6 +53,9 @@ const StatusBadge = (s) => {
     partial: ["warn", "部分成交"],
     unmatched: ["muted", "未成交"],
     reserved: ["warn", "待结算"],
+    reversed: ["muted", "已冲正"],
+    partial_reversed: ["warn", "部分回退"],
+    defaulted: ["danger", "违约欠缴"],
   };
   const [cls, label] = map[s] || ["muted", s];
   return `<span class="badge ${cls}">${label}</span>`;
@@ -81,6 +84,9 @@ const txLabel = {
   auction_deliver_out: "竞价结算划出",
   auction_deliver_in: "竞价结算受让",
   auction_deficit_clear: "竞价到账清缴缺口",
+  auction_clearance_reversal: "竞价冲正退还清缴",
+  auction_reversal_clawback: "竞价冲正追回配额",
+  auction_reversal_return: "竞价冲正退还卖方",
 };
 
 const orderStatusMap = {
