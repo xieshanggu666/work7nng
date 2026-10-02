@@ -66,8 +66,12 @@ class AllowanceTransaction(Base):
     # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/reversal/
     # trade_reserve/trade_release/trade_deliver_out/trade_deliver_in/
     # auction_bid_reserve/auction_bid_release/auction_reserve_release/
-    # auction_deliver_out/auction_deliver_in/auction_deficit_clear
-    tx_type = Column(String(24), nullable=False)
+    # auction_deliver_out/auction_deliver_in/auction_deficit_clear/
+    # auction_reverse_out/auction_reverse_in（结算划转回退）、
+    # auction_clear_unfreeze/auction_clear_refund（联动清缴回滚：解冻/退还补缴）、
+    # auction_clawback_out/auction_clawback_in（违约买方配额收回并划付卖方）、
+    # auction_default_repay_out/auction_default_repay_in（违约补缴追偿）
+    tx_type = Column(String(26), nullable=False)
     amount = Column(Numeric(18, 4), nullable=False, default=0)
     counterparty = Column(String(128), nullable=False, default="")
     price = Column(Numeric(18, 2), nullable=True)

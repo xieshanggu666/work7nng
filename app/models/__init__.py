@@ -8,8 +8,11 @@ from app.models.allowance import (
 from app.models.auction import (
     AuctionAuditLog,
     AuctionBid,
+    AuctionDefaultRepayment,
+    AuctionReversalBatch,
     AuctionSession,
     AuctionTrade,
+    AuctionTradeReversal,
 )
 from app.models.company import Company, EmissionScope
 from app.models.emission import (
@@ -39,6 +42,9 @@ __all__ = [
     "AuctionSession",
     "AuctionBid",
     "AuctionTrade",
+    "AuctionTradeReversal",
+    "AuctionReversalBatch",
+    "AuctionDefaultRepayment",
     "AuctionAuditLog",
     "MrvReport",
 ]

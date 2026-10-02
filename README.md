@@ -6,7 +6,7 @@
 
 - **后端**：Python 3.10+ / FastAPI / SQLAlchemy ORM / SQLite / JWT（Cookie 认证）
 - **前端**：React 18（本地 UMD 运行时 + htm 模板引擎，无需构建工具，完全离线可用）
-- **测试**：pytest（151 项全部通过，含多线程并发与交割/结算闭环一致性测试）
+- **测试**：pytest（186 项全部通过，含多线程并发、交割/结算闭环与冲正/违约回退一致性测试）
 
 ## 快速开始
 
@@ -17,6 +17,8 @@ uvicorn app.main:app --reload  # 启动服务
 ```
 
 > 升级旧库（新增幂等键列与唯一约束）：`python scripts/migrate_concurrency.py`，可重复执行。
+>
+> 已结算竞价冲正/违约回退链路升级（新增 3 张表与成交单冲正/违约列、场次自动追偿开关）：`python scripts/migrate_auction_reversal.py`，可重复执行。
 
 访问 http://127.0.0.1:8000
 
@@ -44,15 +46,17 @@ uvicorn app.main:app --reload  # 启动服务
 7. **企业间交易订单**：双方挂单 → 双方确认（卖方配额转为**交易占用**）→ 交割（双方配额账户与流水同步）；交割前任一方可撤销并释放占用
 8. **履约闭环（年度配额闭环）**：MRV 报告批准后按批准排放快照冻结配额；清缴优先核销冻结配额，不足部分扣减可用配额；缺口年度买入或补充分配后可补缴；**企业间订单交割默认在同一事务内自动核销买方同年度履约缺口**（先冻结核销、再用到账配额补缴），交割完成即见履约状态/配额状态/统计一致更新；挂单可通过 `auto_clear_deficit=false` 关闭联动，改为事后手动清缴；报告冲正会解冻并退还已清缴配额、归档旧履约记录
 9. **MRV 报告**：年度范围一二三汇总生成，草稿 → 提交 → 批准状态流转；已批准报告不得直接覆盖，须由监管/核查角色通过冲正接口异常回滚；**批准时若该企业年度仍有未核验活动数据将被拒绝**，防止未核查数据经报告快照污染配额冻结与履约结果
-10. **碳配额集中竞价市场**：监管建场（草稿/开放）→ 买/卖方企业密封报价（卖出报价即占用可用配额）→ 监管统一撮合（最大成交量定价、价格-时间优先、自成交规避）→ 集中结算（双方配额账户与流水同事务落账并核销买方履约缺口）；支持撤单、撮合前/后撤场（逐级释放占用）、并发结算抢占、全场次操作与越权拒绝审计
+10. **碳配额集中竞价市场**：监管建场（草稿/开放）→ 买/卖方企业密封报价（卖出报价即占用可用配额）→ 监管统一撮合（最大成交量定价、价格-时间优先、自成交规避）→ 集中结算（双方配额账户与流水同事务落账并核销买方履约缺口）；支持撤单、撮合前/后撤场（逐级释放占用）、并发结算抢占、全场次操作与越权拒绝审计；**已结算成交支持监管冲正与违约回退**（见下）
+11. **已结算成交监管冲正 / 违约回退**：监管可对已结算成交单做整笔、批量或部分数量冲正，同一事务内回退双方配额划转、按成交单流水归属精确回滚联动清缴（退还到账补缴）、同步回退履约清缴记录与配额状态并写冲正单/批次与审计；买方自由可用不足时只收回可得部分、不足登记为违约欠额（成交单 `defaulted`），买方可由监管手动追偿或在后续场次结算到账后自动追偿（`auto_recover_default`，先清缴后追偿），欠额结清后成交单转为 `reversed`；冲正批次与补缴均有幂等键，并发重复操作只生效一次
 
 ### 集中竞价市场设计要点
 
 - **场次状态机**：`draft → open → matched → settled`，draft/open/matched 均可撤场为 `cancelled`（settled 终态）；状态流转用条件 UPDATE 抢占，并发撮合/结算/撤场只有一方成功
 - **统一价格（uniform-price）集合竞价**：在各买卖报价档上计算可行成交量，取成交量最大档；多档并列先选未匹配量最小档、仍并列取候选档均价；价格-时间优先配对（买价降序/卖价升序、同价按报价时间），同一企业不与自身成交
 - **卖出报价即占用**：卖出报价提交瞬间把报量从自由可用转为 `reserved`（与企业间订单共用同一套 `current ≥ frozen + reserved` 原子约束），撤单/未成交余量/撮合零成交/撤场逐级释放，成交部分保留至结算出库——从数据库层杜绝跨场次超卖
-- **结算即清缴**：卖方占用出库（current/reserved 同减）、买方到账（current 同增）与买方同年度履约缺口核销共用一个事务、一套锁（`account: < auction: < clear: < order:`），先冻结核销、后到账补缴；场次可通过 `auto_clear_deficit=false` 关闭联动
-- **权限审计**：场次管理仅 admin、企业只能为本企业报价/撤单且只见本企业成交、审计日志仅监管可见；建场/开放/报价/撤单/撮合/结算与每一次越权拒绝（含越权读审计、越权撤单）均写 `auction_audit_logs`
+- **结算即清缴**：卖方占用出库（current/reserved 同减）、买方到账（current 同增）与买方同年度履约缺口核销共用一个事务、一套锁（`account: < auction: < clear: < order:`），先冻结核销、后到账补缴；逐笔成交的冻结核销/到账补缴流水均关联成交单（冻结核销用买方自有冻结配额、到账补缴为成交交付量），场次可通过 `auto_clear_deficit=false` 关闭联动
+- **监管冲正与违约回退（settled → reversed/defaulted → reversed）**：`POST /api/auctions/{id}/reverse` 支持整笔/批量/部分数量冲正，冲正批次（`auction_reversal_batches`）、逐笔冲正单（`auction_trade_reversals`）、双方回退流水（`auction_clawback_out/in`、`auction_clear_refund`）、履约记录回退与审计在单一事务提交；仅到账补缴（`auction_deficit_clear`）随交易回退，自有冻结核销不因交易取消而回滚；买方自由可用不足时尽力收回、差额登记违约欠额（`defaulted_amount`），监管可 `POST /api/auctions/trades/{id}/repay` 逐笔或 `POST /api/auctions/defaults/{buyer}/recover` 按买方追偿（`auction_default_repay_out/in`），后续场次结算到账时在清缴之后自动追偿（绝不挪用履约配额）
+- **权限审计**：场次管理仅 admin、企业只能为本企业报价/撤单且只见本企业成交、审计/冲正记录仅监管可见；建场/开放/报价/撤单/撮合/结算/**冲正/违约追偿**与每一次越权拒绝（含越权读审计、越权撤单）均写 `auction_audit_logs`
 
 ### 并发一致性保障（清缴 / 交易 / 企业间订单）
 
@@ -65,9 +69,9 @@ uvicorn app.main:app --reload  # 启动服务
 - **重复提交**：流水、履约记录与订单均支持幂等键（请求体 `idempotency_key` 或 `Idempotency-Key` 请求头），双击 / 超时重试只入账一次；前端提交期间禁用按钮并自动生成幂等键
 - **数据库兜底约束**：`quotas` 的 (企业, 年度) 唯一约束防止并发分配重复；活跃 `compliance_records` 的 (企业, 年度) 部分唯一索引允许冲正归档后重新批准；`trade_orders` 幂等键唯一约束防止重复挂单
 
-## 数据表（18 张）
+## 数据表（21 张）
 
-`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_audit_logs`
+`users` `companies` `emission_scopes` `activity_data` `emission_factors` `factor_versions` `calculation_methods` `emission_results` `quotas` `allowance_accounts` `allowance_transactions` `compliance_records` `mrv_reports` `trade_orders` `auction_sessions` `auction_bids` `auction_trades` `auction_trade_reversals` `auction_reversal_batches` `auction_default_repayments` `auction_audit_logs`
 
 ## API 摘要
 
@@ -104,14 +108,21 @@ uvicorn app.main:app --reload  # 启动服务
 | POST | `/api/auctions/bids/{id}/cancel` | 撤单：企业撤本企业单 / admin 撤任意单，卖出占用即时释放 |
 | GET | `/api/auctions/trades/all` | 全部成交（监管/核查，企业 403 并审计） |
 | GET | `/api/auctions/my-trades` | 本企业参与的成交 |
+| POST | `/api/auctions/{id}/reverse` | 监管冲正已结算成交（整笔/批量/部分数量，需原因，支持幂等键） |
+| GET | `/api/auctions/reversals` | 冲正批次/逐笔冲正单/违约补缴记录（admin/verifier，企业 403 并审计） |
+| GET | `/api/auctions/defaults` | 待追偿违约欠额（监管全部 / 企业仅本企业） |
+| POST | `/api/auctions/trades/{id}/repay` | 监管对单笔违约成交手动追偿（amount 缺省为全额，尽力而为） |
+| POST | `/api/auctions/defaults/{buyer_id}/recover?year=` | 监管按买方某年度汇总追偿全部欠额 |
 | GET | `/api/auctions/audit-logs` | 权限与操作审计（admin/verifier，越权读取 403 并留痕） |
 
 ## 测试
 
 ```bash
-python -m pytest tests/ -v   # 151 passed
+python -m pytest tests/ -v   # 186 passed
 ```
 
 覆盖：核算引擎两种公式、因子按年取值、核算幂等、配额分配幂等、清缴达标/缺口与补缴、交易余额校验、MRV 状态机、API 冒烟、越权防护、企业间订单全状态机（挂单/单方及双方确认/撤销释放/交割双方入账/幂等与非法流转拒绝），以及多线程并发交易/清缴/订单（无超额扣减、占用与冻结互不挤占、流水三类快照链一致、幂等键去重、失败整体回滚、交割与撤销竞争只有一方成功、清缴与交易并发三方一致）；另有交割联动清缴闭环专项测试：足额/部分/超买补缴、纯冻结记录核销、关闭联动后手动清缴、卖方义务不被触动、重复交割只核销一次、两笔订单交割与手动清缴并发后"余额 / 流水 / 履约记录 / 仪表盘统计"四方一致且年度配额守恒（持仓 + 已清缴 = 分配总量）。
 
 集中竞价市场专项（`test_auction.py` / `test_auction_api.py`，46 项）：场次草稿/开放/撮合/结算状态机与幂等建场；密封报价保留价校验、同企业同方向唯一、卖出超可用拒绝、撤单释放；统一价格撮合的最大成交量/未匹配量/均价并列规则、价格-时间优先、部分成交、零成交、自成交规避、卖出按可用封顶且未成交余量释放；结算双方划转与流水五快照链守恒、买方缺口足额/部分/超买联动核销、关闭联动留存缺口；撮合后撤场逐笔释放、开放期撤场批量释放报价占用；多线程并发结算只划转一次、结算与撤场竞争恰一方胜出、跨场次并发卖出总占用不超过自由可用、结算与手动清缴并发守恒；API 角色边界（企业/核查/监管）、越权撤单与越权读审计的拒绝留痕、HTTP 并发结算幂等。
+
+冲正与违约回退专项（`test_auction_reversal.py` / `test_auction_reversal_api.py`，35 项）：无联动清缴的整笔/批量/部分数量冲正及重复冲正拒绝、幂等键去重；冲正按成交单归属精确回滚到账补缴、履约记录 cleared/deficit 与配额状态同步回退、部分冲正保持 settled 且可分次冲正至 reversed；买方配额已转出时冲正只收回自由可用余额、差额登记违约欠额与卖方待追偿敞口，监管逐笔/按买方手动追偿（受自由可用约束、超额自动封顶、无可用拒绝）、后续场次结算到账同事务自动追偿、关闭 `auto_recover_default` 不追偿，欠额结清后 defaulted → reversed；多线程并发冲正只生效一次、并发部分冲正累计不超过成交量、冲正与下一场结算自动追偿并发不超额；流水三快照链与配额守恒；API 角色边界（仅 admin 可冲正/追偿、企业越权 403 并审计）、HTTP 并发冲正幂等、冲正/追偿审计留痕。

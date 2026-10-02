@@ -19,6 +19,8 @@ const bidStatusMap = {
 const auctionTradeStatusMap = {
   reserved: ["warn", "待结算"],
   settled: ["ok", "已结算"],
+  reversed: ["muted", "已冲正"],
+  defaulted: ["danger", "买方违约"],
   cancelled: ["danger", "已作废"],
 };
 
@@ -28,6 +30,10 @@ const actionTextMap = {
   "session.match": "撮合",
   "session.settle": "结算",
   "session.cancel": "撤场",
+  "session.reverse": "监管冲正",
+  "trade.reverse": "冲正成交单",
+  "trade.default.recover": "违约追偿",
+  "trade.default.auto_recover": "结算自动追偿",
   "bid.place": "提交报价",
   "bid.cancel": "撤销报价",
   "trade.read": "读取全量成交",
@@ -46,7 +52,9 @@ views.AuctionView = () => {
   const [trades, setTrades] = React.useState([]);
   const [logs, setLogs] = React.useState([]);
   const [myTrades, setMyTrades] = React.useState([]);
-  const [tab, setTab] = React.useState("sessions"); // sessions / bids / trades / audit
+  const [defaults, setDefaults] = React.useState([]);
+  const [reversals, setReversals] = React.useState({ batches: [], reversals: [], repayments: [] });
+  const [tab, setTab] = React.useState("sessions"); // sessions / bids / trades / audit / defaults / reversals
   const [selYear, setSelYear] = React.useState(2026);
   const [form, setForm] = React.useState({
     name: "", year: 2026, reserve_price: 70, estimated_volume: "",
@@ -147,6 +155,45 @@ views.AuctionView = () => {
     sessionAction(s, "cancel", "撤场", { reason });
   };
 
+  const reverseSession = (s) => {
+    const reason = prompt(`监管冲正场次 ${s.session_no} 全部已结算成交单的原因（将回退双方配额与联动清缴，买方不足将登记违约）：`, "");
+    if (reason === null || reason.trim().length < 2) {
+      if (reason !== null) alert("请填写至少 2 个字符的冲正原因");
+      return;
+    }
+    sessionAction(s, "reverse", "冲正", { reason });
+  };
+
+  const loadDefaults = React.useCallback(async () => {
+    try {
+      setDefaults(await api.get(`/api/auctions/defaults?year=${selYear || ""}`));
+    } catch (e) { setMsg({ type: "err", text: e.message }); }
+  }, [selYear]);
+
+  const loadReversals = React.useCallback(async () => {
+    try {
+      setReversals(await api.get("/api/auctions/reversals?limit=300"));
+    } catch (e) { setMsg({ type: "err", text: e.message }); }
+  }, []);
+
+  const repayTrade = async (t) => {
+    if (!confirm(`对成交单 ${t.trade_no} 追偿买方违约欠额 ${fmtNum(t.default_outstanding, 4)} 吨？`)) return;
+    try {
+      const r = await api.post(`/api/auctions/trades/${t.id}/repay`, {}, api.idemKey());
+      refresh("ok", `已追偿 ${fmtNum(r.repayment.quantity, 4)} 吨` +
+        (r.trade.status === "reversed" ? "，欠额结清，成交单转为已冲正" : "，仍有剩余欠额"));
+      loadDefaults();
+    } catch (err) { setMsg({ type: "err", text: err.message }); }
+  };
+
+  const recoverBuyer = async (buyerId) => {
+    try {
+      const r = await api.post(`/api/auctions/defaults/${buyerId}/recover?year=${selYear || ""}`, {}, api.idemKey());
+      refresh("ok", `已按买方自由可用追偿 ${fmtNum(r.recovered_volume, 4)} 吨`);
+      loadDefaults();
+    } catch (err) { setMsg({ type: "err", text: err.message }); }
+  };
+
   const placeBid = async (e) => {
     e.preventDefault();
     if (!selected || busy) return;
@@ -184,17 +231,23 @@ views.AuctionView = () => {
         </div>
         ${isRegulator && html`
           <div class="field" style=${{flexDirection: "row", alignItems: "center", gap: 6}}>
-            <button class="btn ghost sm" onClick=${() => setTab(tab === "audit" ? "sessions" : "audit")}>
-              ${tab === "audit" ? "返回场次" : "查看权限审计"}
+            <button class="btn ghost sm" onClick=${() => { setTab("defaults"); loadDefaults(); }}>违约欠额</button>
+            <button class="btn ghost sm" onClick=${() => { setTab("reversals"); loadReversals(); }}>冲正记录</button>
+            <button class="btn ghost sm" onClick=${() => { setTab(tab === "audit" ? "sessions" : "audit"); }}>
+              ${tab === "audit" ? "返回场次" : "权限审计"}
             </button>
           </div>`}
       </div>
 
+      ${tab === "defaults" ? html`
+        <DefaultPanel defaults=${defaults} isAdmin=${isAdmin} onRepay=${repayTrade} onRecover=${recoverBuyer} />` : ""}
+      ${tab === "reversals" && isRegulator ? html`
+        <ReversalPanel data=${reversals} />` : ""}
       ${tab === "audit" && isRegulator ? html`
         <div>
           <h4>权限与操作审计（全部场次）</h4>
           <AuditLogs />
-        </div>` : html`
+        </div>` : (tab === "sessions" ? html`
       <table>
         <thead><tr>
           <th>场次号</th><th>名称</th><th>年度</th><th>保留价</th><th>状态</th>
@@ -223,14 +276,16 @@ views.AuctionView = () => {
                 ${isAdmin && s.status === "matched" && html`
                   <button class="btn sm" style=${{marginLeft: 6}} onClick=${() => sessionAction(s, "settle", "结算")}>结算</button>
                   <button class="btn sm danger" style=${{marginLeft: 6}} onClick=${() => cancelSession(s)}>撤场</button>`}
+                ${isAdmin && s.status === "settled" && html`
+                  <button class="btn sm danger" style=${{marginLeft: 6}} onClick=${() => reverseSession(s)}>监管冲正</button>`}
               </td>
             </tr>`)}
           ${sessions.length === 0 && html`<tr><td colspan="10" class="empty">暂无竞价场次</td></tr>`}
         </tbody>
-      </table>`}
+      </table>` : "")}
     </div>
 
-    ${isAdmin && tab !== "audit" && html`
+    ${isAdmin && tab === "sessions" && html`
     <div class="panel">
       <h3>创建竞价场次</h3>
       <form class="form-grid" onSubmit=${createSession}>
@@ -263,7 +318,7 @@ views.AuctionView = () => {
       </div>
     </div>`}
 
-    ${selected && tab !== "audit" && html`
+    ${selected && tab === "sessions" && html`
     <div class="panel">
       <h3>场次 ${selected.session_no} · 报价与成交</h3>
       <div class="cards">
@@ -382,4 +437,123 @@ const AuditLogs = ({ inline, logs: injected }) => {
         ${data.length === 0 && html`<tr><td colspan="8" class="empty">暂无审计记录</td></tr>`}
       </tbody>
     </table>`;
+};
+
+// 违约欠额面板：监管可逐笔追偿或按买方汇总追偿，企业仅见本企业欠额
+const DefaultPanel = ({ defaults, isAdmin, onRepay, onRecover }) => {
+  const buyers = [...new Map(defaults.map((t) => [t.buyer_id, t.buyer_name])).entries()];
+  return html`
+    <div class="panel">
+      <h3>竞价违约欠额${defaults.length ? `（${defaults.length} 笔）` : ""}</h3>
+      <div class="empty" style=${{textAlign: "left", marginTop: 0, marginBottom: 10}}>
+        已结算成交被监管冲正时，若买方自由可用配额不足，未收回部分登记为违约欠额；
+        买方可由监管手动追偿，或在后续场次结算到账时自动追偿，欠额结清后成交单转为“已冲正”。
+      </div>
+      <table>
+        <thead><tr>
+          <th>成交单号</th><th>场次</th><th>买方</th><th>卖方</th>
+          <th>违约欠额 (t)</th><th>已追偿 (t)</th><th>待追偿 (t)</th><th>操作</th>
+        </tr></thead>
+        <tbody>
+          ${defaults.map((t) => html`
+            <tr key=${t.id}>
+              <td class="mono">${t.trade_no}</td>
+              <td class="mono">#${t.session_id}</td>
+              <td>${t.buyer_name}</td>
+              <td>${t.seller_name}</td>
+              <td>${fmtNum(t.defaulted_amount, 4)}</td>
+              <td>${fmtNum(t.repaid_amount, 4)}</td>
+              <td style=${{fontWeight: 600, color: "var(--red)"}}>${fmtNum(t.default_outstanding, 4)}</td>
+              <td>${isAdmin ? html`
+                <button class="btn sm" onClick=${() => onRepay(t)}>追偿本笔</button>`
+                : html`<span class="muted">请联系监管补缴</span>`}</td>
+            </tr>`)}
+          ${defaults.length === 0 && html`<tr><td colspan="8" class="empty">暂无违约欠额</td></tr>`}
+        </tbody>
+      </table>
+      ${isAdmin && buyers.length > 0 && html`
+      <h4 style=${{marginTop: 14}}>按买方汇总追偿（用其当前自由可用尽力偿还全部欠额）</h4>
+      <div style=${{display: "flex", gap: 8, flexWrap: "wrap"}}>
+        ${buyers.map(([bid, name]) => html`
+          <button class="btn sm ghost" key=${bid} onClick=${() => onRecover(bid)}>
+            追偿买方：${name}
+          </button>`)}
+      </div>`}
+    </div>`;
+};
+
+// 冲正记录面板：冲正批次、逐笔冲正明细与违约补缴/追偿
+const ReversalPanel = ({ data }) => {
+  const { batches, reversals, repayments } = data;
+  return html`
+    <div class="panel">
+      <h3>监管冲正批次（${batches.length}）</h3>
+      <table>
+        <thead><tr>
+          <th>批次号</th><th>场次</th><th>回退量 (t)</th><th>收回 (t)</th>
+          <th>违约欠额 (t)</th><th>笔数</th><th>原因</th><th>时间</th>
+        </tr></thead>
+        <tbody>
+          ${batches.map((b) => html`
+            <tr key=${b.id}>
+              <td class="mono">${b.batch_no}</td>
+              <td class="mono">#${b.session_id}</td>
+              <td>${fmtNum(b.reverse_volume, 4)}</td>
+              <td>${fmtNum(b.recovered_volume, 4)}</td>
+              <td style=${b.default_volume > 0 ? "color:var(--red);font-weight:600" : ""}>${fmtNum(b.default_volume, 4)}</td>
+              <td>${b.trade_count}</td>
+              <td style=${{maxWidth: 220}}>${b.reason}</td>
+              <td>${new Date(b.created_at).toLocaleString("zh-CN", { hour12: false })}</td>
+            </tr>`)}
+          ${batches.length === 0 && html`<tr><td colspan="8" class="empty">暂无冲正批次</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>逐笔冲正明细（${reversals.length}）</h3>
+      <table>
+        <thead><tr>
+          <th>冲正单号</th><th>成交单</th><th>回退 (t)</th>
+          <th>退还补缴 (t)</th><th>解除冻结 (t)</th><th>收回 (t)</th><th>违约 (t)</th>
+        </tr></thead>
+        <tbody>
+          ${reversals.map((r) => html`
+            <tr key=${r.id}>
+              <td class="mono">${r.reversal_no}</td>
+              <td class="mono">#${r.trade_id}</td>
+              <td>${fmtNum(r.quantity, 4)}</td>
+              <td>${fmtNum(r.clear_refunded, 4)}</td>
+              <td>${fmtNum(r.clear_unfrozen, 4)}</td>
+              <td>${fmtNum(r.recovered_quantity, 4)}</td>
+              <td style=${r.defaulted_quantity > 0 ? "color:var(--red);font-weight:600" : ""}>${fmtNum(r.defaulted_quantity, 4)}</td>
+            </tr>`)}
+          ${reversals.length === 0 && html`<tr><td colspan="7" class="empty">暂无冲正明细</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>违约补缴/追偿记录（${repayments.length}）</h3>
+      <table>
+        <thead><tr>
+          <th>补缴单号</th><th>成交单</th><th>买方</th><th>卖方</th>
+          <th>数量 (t)</th><th>方式</th><th>备注</th><th>时间</th>
+        </tr></thead>
+        <tbody>
+          ${repayments.map((p) => html`
+            <tr key=${p.id}>
+              <td class="mono">${p.repay_no}</td>
+              <td class="mono">#${p.trade_id}</td>
+              <td>${p.buyer_id}</td>
+              <td>${p.seller_id}</td>
+              <td>${fmtNum(p.quantity, 4)}</td>
+              <td>${p.source === "auto" ? html`<span class="badge info">结算自动</span>` : html`<span class="badge ok">监管手动</span>`}</td>
+              <td>${p.remark || "-"}</td>
+              <td>${new Date(p.created_at).toLocaleString("zh-CN", { hour12: false })}</td>
+            </tr>`)}
+          ${repayments.length === 0 && html`<tr><td colspan="8" class="empty">暂无补缴记录</td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
 };

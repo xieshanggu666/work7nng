@@ -27,8 +27,11 @@ from app.core.database import Base  # noqa: E402
 from app.models import (  # noqa: F401,E402
     AuctionAuditLog,
     AuctionBid,
+    AuctionDefaultRepayment,
+    AuctionReversalBatch,
     AuctionSession,
     AuctionTrade,
+    AuctionTradeReversal,
     TradeOrder,
 )
 

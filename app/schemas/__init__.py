@@ -93,6 +93,8 @@ class AuctionSessionIn(BaseModel):
     estimated_volume: float | None = Field(default=None, ge=0)
     product: str = Field(default="allowance", pattern="^(allowance|CCER)$")
     auto_clear_deficit: bool = True
+    # 后续场次结算到账时，是否自动用买方自由可用追偿其历史违约欠额（默认开启）
+    auto_recover_default: bool = True
     remark: str = Field(default="", max_length=256)
     # 传入即“创建并直接开放”；缺省为草稿，监管随后调用开放接口
     open_at: datetime | None = None
@@ -115,3 +117,21 @@ class AuctionBidIn(BaseModel):
 
 class AuctionBidCancelIn(BaseModel):
     reason: str = Field(default="", max_length=256)
+
+
+class AuctionTradeReversalIn(BaseModel):
+    """监管冲正已结算成交单：可整笔/批量/部分数量。"""
+
+    reason: str = Field(min_length=2, max_length=500)
+    # 缺省冲正场次全部已结算成交单；指定时仅冲正列表内成交单
+    trade_ids: list[int] | None = None
+    # 部分回退：{成交单id: 数量}；缺省整笔回退
+    quantities: dict[int, float] | None = None
+    idempotency_key: str | None = None
+
+
+class AuctionDefaultRepayIn(BaseModel):
+    """监管手动追偿单笔违约欠额；amount 缺省为全额。"""
+
+    amount: float | None = Field(default=None, gt=0)
+    idempotency_key: str | None = None

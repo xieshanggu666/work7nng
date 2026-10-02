@@ -44,6 +44,8 @@ class AuctionSession(Base):
     trade_count = Column(Integer, nullable=False, default=0)
     # 结算时是否用买方到账配额自动核销其同年度履约缺口（默认开启，年度配额闭环）
     auto_clear_deficit = Column(Integer, nullable=False, default=1)
+    # 后续场次结算到账时，是否自动用买方自由可用配额追偿其历史违约欠额（默认开启）
+    auto_recover_default = Column(Integer, nullable=False, default=1)
     open_at = Column(DateTime, nullable=True)
     close_at = Column(DateTime, nullable=True)
     matched_at = Column(DateTime, nullable=True)
@@ -112,7 +114,15 @@ class AuctionTrade(Base):
     状态：
     - reserved：撮合完成，卖方配额已转为交易占用，等待场次统一结算；
     - settled：已结算，卖方出库 / 买方到账 / 履约缺口核销全部落库；
+    - reversed：监管冲正完成，结算划转已回退（含联动清缴回滚），
+      无违约敞口；
+    - defaulted：冲正时买方持仓不足，部分配额无法收回，登记违约欠额，
+      待买方补缴追偿；补缴结清后自动转为 reversed；
     - cancelled：撮合后场次被监管撤销，占用已释放，成交单作废。
+
+    注：已 settled 的成交单可能仅被部分冲正（监管指定的数量小于成交量），
+    此时状态保持 settled，已冲正量累计在 ``reversed_quantity``；仅在整笔
+    成交单被完全冲正（reversed_quantity == quantity）时才离开 settled。
     """
 
     __tablename__ = "auction_trades"
@@ -128,9 +138,97 @@ class AuctionTrade(Base):
     quantity = Column(Numeric(18, 4), nullable=False)
     price = Column(Numeric(18, 2), nullable=False, default=0)  # 统一出清价
     alloc_seq = Column(Integer, nullable=False, default=0)     # 价格-时间优先撮合序号
+    # reserved/settled/reversed/defaulted/cancelled
     status = Column(String(16), nullable=False, default="reserved", index=True)
     settled_at = Column(DateTime, nullable=True)
+    # 监管冲正累计回退量（≤ quantity）；defaulted_amount 为买方无法收回、待追偿的欠额
+    reversed_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    defaulted_amount = Column(Numeric(18, 4), nullable=False, default=0)
+    repaid_amount = Column(Numeric(18, 4), nullable=False, default=0)
     cancelled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AuctionReversalBatch(Base):
+    """监管对已结算场次的冲正批次：一次操作可覆盖多笔成交单。
+
+    批次与批次内全部冲正单、账户/流水/履约回退在同一事务提交（同生共死）。
+    ``idempotency_key`` 唯一约束保证双击/超时重试只生效一次。
+    """
+
+    __tablename__ = "auction_reversal_batches"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_auction_reversal_batch_idem"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    batch_no = Column(String(32), nullable=False, unique=True, index=True)
+    session_id = Column(Integer, ForeignKey("auction_sessions.id"), nullable=False, index=True)
+    reason = Column(String(500), nullable=False, default="")
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    trade_count = Column(Integer, nullable=False, default=0)       # 批次内冲正单笔数
+    reverse_volume = Column(Numeric(18, 4), nullable=False, default=0)  # 本次回退配额合计
+    recovered_volume = Column(Numeric(18, 4), nullable=False, default=0)  # 自买方收回并退还卖方
+    default_volume = Column(Numeric(18, 4), nullable=False, default=0)    # 买方违约欠额合计
+    idempotency_key = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AuctionTradeReversal(Base):
+    """单笔成交单的冲正明细：配额回退、清缴回滚与违约登记的审计凭据。
+
+    每笔成交单可被分多次部分冲正（每次一行），各行 reverse_quantity 之和
+    不超过成交单量；由批次事务 + 成交单行锁串行化，并发冲正不会超额回退。
+    """
+
+    __tablename__ = "auction_trade_reversals"
+
+    id = Column(Integer, primary_key=True)
+    reversal_no = Column(String(32), nullable=False, unique=True, index=True)
+    batch_id = Column(Integer, ForeignKey("auction_reversal_batches.id"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("auction_sessions.id"), nullable=False, index=True)
+    trade_id = Column(Integer, ForeignKey("auction_trades.id"), nullable=False, index=True)
+    buyer_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    seller_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    quantity = Column(Numeric(18, 4), nullable=False)             # 本次申请回退量
+    # 结算联动清缴回滚：解除冻结 f 吨、回退已补缴自由配额 c 吨
+    clear_unfrozen = Column(Numeric(18, 4), nullable=False, default=0)
+    clear_refunded = Column(Numeric(18, 4), nullable=False, default=0)
+    # 自买方自由可用实际收回（f+c 中拿得回的部分）；不足部分登记违约欠额
+    recovered_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    defaulted_quantity = Column(Numeric(18, 4), nullable=False, default=0)
+    reason = Column(String(500), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AuctionDefaultRepayment(Base):
+    """买方违约欠额补缴/追偿：买方补足配额后划付受影响卖方并解除违约。
+
+    可由监管手动触发，或在后续场次结算（买方有配额到账）时自动追偿。
+    每笔成交单每次追偿一行；``repaid_quantity`` 累计达到欠额时，
+    成交单由 defaulted 回到 reversed。
+    """
+
+    __tablename__ = "auction_default_repayments"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_auction_default_repay_idem"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    repay_no = Column(String(32), nullable=False, unique=True, index=True)
+    session_id = Column(Integer, ForeignKey("auction_sessions.id"), nullable=False, index=True)
+    trade_id = Column(Integer, ForeignKey("auction_trades.id"), nullable=False, index=True)
+    reversal_id = Column(Integer, ForeignKey("auction_trade_reversals.id"), nullable=True, index=True)
+    buyer_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    seller_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    quantity = Column(Numeric(18, 4), nullable=False)             # 本次追偿量
+    # auto=后续结算到账自动追偿；manual=监管手动触发
+    source = Column(String(16), nullable=False, default="manual")
+    operator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    remark = Column(String(256), nullable=False, default="")
+    idempotency_key = Column(String(64), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 

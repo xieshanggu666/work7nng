@@ -525,6 +525,22 @@ def _apply_clearance(
         balance_after, frozen_after, reserved_after = apply_ledger_delta(
             db, account.id, -frozen_use, -frozen_use, 0
         )
+        if trade_order is not None:
+            f_seller = db.get(Company, trade_order.seller_id)
+            f_counterparty = f_seller.name if f_seller else f"企业{trade_order.seller_id}"
+            f_remark = f"订单 {trade_order.order_no} 交割，冻结配额履约清缴 {frozen_use} 吨"
+            f_trade_order_id = trade_order.id
+            f_auction_trade_id = None
+            f_price = float(trade_order.price)
+        else:
+            # 冻结核销使用的是买方自有冻结配额，并非交易/竞价到账量，因此即使
+            # 由结算联动触发，流水也不关联成交单（冲正成交单时不回滚这部分——
+            # 交易取消不影响企业用自有冻结配额履约这一事实）。
+            f_counterparty = "履约清缴"
+            f_remark = f"{year}年度冻结配额履约清缴 {frozen_use} 吨"
+            f_trade_order_id = None
+            f_auction_trade_id = None
+            f_price = None
         _add_ledger_tx(
             db,
             account,
@@ -532,13 +548,17 @@ def _apply_clearance(
             frozen_use,
             balance_after,
             frozen_after,
-            "履约清缴",
-            f"{year}年度冻结配额履约清缴 {frozen_use} 吨",
+            f_counterparty,
+            f_remark,
             tx_date=deadline,
             reserved_after=reserved_after,
+            trade_order_id=f_trade_order_id,
+            auction_trade_id=f_auction_trade_id,
+            price=f_price,
         )
 
     still_remaining = round(remaining - frozen_use, 4)
+    current_use = 0.0
     if still_remaining > 0 and account:
         # 清缴补扣只能使用自由可用配额，已确认订单占用的交易配额不得被清缴挪用。
         # 实扣额由数据库在写锁内按 min(剩余缺口, 自由可用) 原子计算，
@@ -749,3 +769,30 @@ def settle_buyer_deficit_on_auction(
     )
     db.refresh(record)
     return record
+
+
+def settle_trade_deficit_on_auction(
+    db: Session,
+    trade: "AuctionTrade",
+    tx_date: str,
+    auto_clear: bool = True,
+) -> ComplianceRecord | None:
+    """单笔竞价成交结算后的逐笔联动清缴（同事务、无独立加锁）。
+
+    与 :func:`settle_buyer_deficit_on_auction` 的区别：结算主流程对每一笔
+    成交单划转后立即调用一次，使冻结核销/自由配额补缴流水都带上
+    ``auction_trade_id``，监管冲正该成交单时可精确回滚它触发的清缴。
+    同一买方多笔成交按 alloc_seq 依次核销，累计清缴仍不超过核查排放量。
+    """
+    if not auto_clear:
+        return None
+    record = _get_active_record(db, trade.buyer_id, trade.year)
+    if record is None or record.status == "reversed":
+        return None
+    return _apply_clearance(
+        db,
+        trade.buyer_id,
+        trade.year,
+        tx_date,
+        auction_trade=trade,
+    )

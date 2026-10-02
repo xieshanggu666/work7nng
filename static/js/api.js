@@ -81,6 +81,12 @@ const txLabel = {
   auction_deliver_out: "竞价结算划出",
   auction_deliver_in: "竞价结算受让",
   auction_deficit_clear: "竞价到账清缴缺口",
+  auction_clear_refund: "冲正退还补缴",
+  auction_clear_unfreeze: "冲正解除冻结",
+  auction_clawback_out: "冲正收回配额",
+  auction_clawback_in: "冲正退回配额",
+  auction_default_repay_out: "违约欠额追偿划出",
+  auction_default_repay_in: "违约欠额追偿到账",
 };
 
 const orderStatusMap = {
